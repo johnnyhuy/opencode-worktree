@@ -454,7 +454,7 @@ export async function openMacOSTerminal(cwd: string, command?: string): Promise<
 
 	// Handle terminals based on whether they use detached spawns
 	try {
-		switch (terminal) {
+			switch (terminal) {
 			// Ghostty uses inline command to avoid permission dialog - no temp script needed
 			case "ghostty": {
 				try {
