@@ -8,6 +8,7 @@
  * interface for terminal operations with proper concurrency control.
  */
 
+import * as crypto from "node:crypto"
 import * as fs from "node:fs/promises"
 import * as os from "node:os"
 import * as path from "node:path"
@@ -72,6 +73,49 @@ function wrapWithSelfCleanup(script: string): string {
 	return `#!/bin/bash
 trap 'rm -f "$0"' EXIT INT TERM
 ${script}`
+}
+
+export function getShellExecLine(): string {
+	return 'exec "${SHELL:-/bin/bash}"'
+}
+
+export function sanitizeFileName(value: string): string {
+	return value.replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || "worktree"
+}
+
+export function encodeWarpPath(filePath: string): string {
+	const parts = filePath.split(path.sep).filter((part, index) => !(index === 0 && part === ""))
+	const encoded = parts.map((part) => encodeURIComponent(part)).join("/")
+	return path.isAbsolute(filePath) ? `/${encoded}` : encoded
+}
+
+export function hashString(value: string): string {
+	return crypto.createHash("sha256").update(value).digest("hex").slice(0, 8)
+}
+
+export function buildWarpLaunchConfig(options: {
+	name: string
+	title: string
+	cwd: string
+	command?: string
+}): string {
+	const lines = [
+		"---",
+		`name: ${JSON.stringify(options.name)}`,
+		"windows:",
+		"  - tabs:",
+		`      - title: ${JSON.stringify(options.title)}`,
+		"        layout:",
+		`          cwd: ${JSON.stringify(options.cwd)}`,
+	]
+
+	if (options.command) {
+		lines.push("          commands:")
+		lines.push(`            - exec: ${JSON.stringify(options.command)}`)
+	}
+
+	lines.push("")
+	return lines.join("\n")
 }
 
 /**
@@ -306,7 +350,11 @@ function detectCurrentMacTerminal(): MacTerminal {
 	if (env.ITERM_SESSION_ID) return "iterm"
 	if (env.KITTY_WINDOW_ID) return "kitty"
 	if (env.ALACRITTY_WINDOW_ID) return "alacritty"
-	if (env.__CFBundleIdentifier === "dev.warp.Warp-Stable") return "warp"
+	if (
+		env.__CFBundleIdentifier === "dev.warp.Warp-Stable" ||
+		env.__CFBundleIdentifier === "dev.warp.Warp-Preview"
+	)
+		return "warp"
 
 	// Fallback to TERM_PROGRAM
 	const termProgram = env.TERM_PROGRAM?.toLowerCase()
@@ -325,6 +373,57 @@ function detectCurrentMacTerminal(): MacTerminal {
 	return "terminal"
 }
 
+function getWarpUriScheme(): "warp" | "warppreview" {
+	const env = macTerminalEnvSchema.parse(process.env)
+	if (env.__CFBundleIdentifier === "dev.warp.Warp-Preview") return "warppreview"
+	return "warp"
+}
+
+async function openWarpTerminal(cwd: string, command?: string): Promise<TerminalResult> {
+	if (!cwd) {
+		return { success: false, error: "Working directory is required" }
+	}
+
+	const scheme = getWarpUriScheme()
+	const openUri = async (uri: string): Promise<TerminalResult> => {
+		try {
+			const proc = Bun.spawn(["open", uri], {
+				detached: true,
+				stdio: ["ignore", "ignore", "ignore"],
+			})
+			proc.unref()
+			return { success: true }
+		} catch (error) {
+			return { success: false, error: error instanceof Error ? error.message : String(error) }
+		}
+	}
+
+	if (!command) {
+		const uri = `${scheme}://action/new_window?path=${encodeURIComponent(cwd)}`
+		return openUri(uri)
+	}
+
+	const launchConfigDir = path.join(os.homedir(), ".warp", "launch_configurations")
+	await fs.mkdir(launchConfigDir, { recursive: true })
+
+	const nameBase = sanitizeFileName(path.basename(cwd) || "worktree")
+	const uniqueSuffix = hashString(cwd)
+	const configPath = path.join(
+		launchConfigDir,
+		`opencode-worktree-${nameBase}-${uniqueSuffix}.yaml`,
+	)
+	const config = buildWarpLaunchConfig({
+		name: `OpenCode Worktree ${nameBase}-${uniqueSuffix}`,
+		title: `Worktree ${nameBase}`,
+		cwd,
+		command,
+	})
+	await Bun.write(configPath, config)
+
+	const uri = `${scheme}://launch${encodeWarpPath(configPath)}`
+	return openUri(uri)
+}
+
 /**
  * Open terminal on macOS (Terminal.app, iTerm, Ghostty, etc.)
  * Detects current terminal and uses appropriate method.
@@ -341,10 +440,11 @@ export async function openMacOSTerminal(cwd: string, command?: string): Promise<
 
 	const escapedCwd = escapeBash(cwd)
 	const escapedCommand = command ? escapeBash(command) : ""
+	const shellExecLine = getShellExecLine()
 	const scriptContent = wrapWithSelfCleanup(
 		command
-			? `cd "${escapedCwd}" && ${escapedCommand}\nexec bash`
-			: `cd "${escapedCwd}"\nexec bash`,
+			? `cd "${escapedCwd}" && ${escapedCommand}\n${shellExecLine}`
+			: `cd "${escapedCwd}"\n${shellExecLine}`,
 	)
 
 	const terminal = detectCurrentMacTerminal()
@@ -358,6 +458,7 @@ export async function openMacOSTerminal(cwd: string, command?: string): Promise<
 			// Ghostty uses inline command to avoid permission dialog - no temp script needed
 			case "ghostty": {
 				try {
+					const defaultShell = process.env.SHELL || "/bin/bash"
 					const proc = Bun.spawn(
 						[
 							"open",
@@ -366,7 +467,7 @@ export async function openMacOSTerminal(cwd: string, command?: string): Promise<
 							"--args",
 							`--working-directory=${cwd}`,
 							"-e",
-							"bash",
+							defaultShell,
 							"-c",
 							command ? `cd "${escapedCwd}" && ${escapedCommand}` : `cd "${escapedCwd}"`,
 						],
@@ -451,21 +552,7 @@ export async function openMacOSTerminal(cwd: string, command?: string): Promise<
 			}
 
 			case "warp": {
-				// Detached spawn - write script directly
-				detachedScriptPath = path.join(
-					getTempDir(),
-					`worktree-${Date.now()}-${Math.random().toString(36).slice(2)}.sh`,
-				)
-				await Bun.write(detachedScriptPath, scriptContent)
-				await fs.chmod(detachedScriptPath, 0o755)
-
-				const warpProc = Bun.spawn(["open", "-b", "dev.warp.Warp-Stable", detachedScriptPath], {
-					detached: true,
-					stdio: ["ignore", "ignore", "ignore"],
-				})
-				warpProc.unref()
-				detachedScriptPath = null // Clear on success - script will self-clean
-				return { success: true }
+				return await openWarpTerminal(cwd, command)
 			}
 
 			// Non-detached terminals: use withTempScript (waits for completion)
@@ -574,10 +661,11 @@ export async function openLinuxTerminal(cwd: string, command?: string): Promise<
 
 	const escapedCwd = escapeBash(cwd)
 	const escapedCommand = command ? escapeBash(command) : ""
+	const shellExecLine = getShellExecLine()
 	const scriptContent = wrapWithSelfCleanup(
 		command
-			? `cd "${escapedCwd}" && ${escapedCommand}\nexec bash`
-			: `cd "${escapedCwd}"\nexec bash`,
+			? `cd "${escapedCwd}" && ${escapedCommand}\n${shellExecLine}`
+			: `cd "${escapedCwd}"\n${shellExecLine}`,
 	)
 
 	// Write script directly - it self-deletes via trap
@@ -888,10 +976,11 @@ export async function openWSLTerminal(cwd: string, command?: string): Promise<Te
 
 	const escapedCwd = escapeBash(cwd)
 	const escapedCommand = command ? escapeBash(command) : ""
+	const shellExecLine = getShellExecLine()
 	const scriptContent = wrapWithSelfCleanup(
 		command
-			? `cd "${escapedCwd}" && ${escapedCommand}\nexec bash`
-			: `cd "${escapedCwd}"\nexec bash`,
+			? `cd "${escapedCwd}" && ${escapedCommand}\n${shellExecLine}`
+			: `cd "${escapedCwd}"\n${shellExecLine}`,
 	)
 
 	// Write script directly - it self-deletes via trap

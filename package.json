@@ -1,0 +1,7 @@
+{
+  "name": "opencode-worktree",
+  "private": true,
+  "devDependencies": {
+    "zod": "^3.24.2"
+  }
+}
